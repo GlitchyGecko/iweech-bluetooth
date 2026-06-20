@@ -1,0 +1,19 @@
+# Config personnelle — ne jamais committer
+config.json
+cookie.txt
+*.log
+
+# Données personnelles
+iweech_trips/
+~/iweech_trips/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
