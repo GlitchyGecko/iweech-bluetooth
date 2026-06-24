@@ -61,12 +61,23 @@ async def authenticate(client):
 
 async def read_full_trip(client):
     chunks = []
-    for _ in range(200):
-        data = bytes(await client.read_gatt_char(CHAR_LAST_TRIP))
+    for attempt in range(200):
+        try:
+            data = bytes(await client.read_gatt_char(CHAR_LAST_TRIP))
+        except Exception as e:
+            print(f"  [!] Erreur lecture chunk {attempt+1}: {e}")
+            if attempt == 0:
+                # Premier chunk échoue → trajet probablement vide ou Pi pas prêt
+                return None
+            # Chunk suivant échoue → on décompresse ce qu'on a
+            break
         if not data:
             break
         chunks.append(data)
-        status = bytes(await client.read_gatt_char(CHAR_READ_ST)).decode("utf-8", errors="replace").strip('\x00')
+        try:
+            status = bytes(await client.read_gatt_char(CHAR_READ_ST)).decode("utf-8", errors="replace").strip('\x00')
+        except Exception:
+            status = ""
         if ":2:" not in status:
             break
     raw = b"".join(chunks)
@@ -100,24 +111,55 @@ async def sync_trips():
         print("[+] Authentifié (Auth=1)")
 
         trips_avail = int.from_bytes(bytes(await client.read_gatt_char(CHAR_TRIPS_AVAIL)), "little")
-        print(f"[*] {trips_avail} trajet(s) disponible(s) sur le vélo")
+        print(f"[*] {trips_avail} trajet(s) signalé(s), lecture en boucle jusqu'à épuisement...")
 
-        for i in range(trips_avail + 1):  # +1 car LastTrip contient aussi le dernier synchro
+        seen_md5s = set()  # éviter les boucles infinies
+        i = 0
+        while True:
             md5 = bytes(await client.read_gatt_char(CHAR_TRIP_MD5)).decode("utf-8", errors="replace").strip('\x00')
             if not md5 or md5 == "0" * 32:
+                print("  [*] Aucun trajet disponible (MD5 vide).")
                 break
+            if md5 in seen_md5s:
+                print(f"  [*] MD5 {md5[:8]}... déjà vu cette session — fin de la file.")
+                break
+            seen_md5s.add(md5)
 
-            # Vérifier si déjà stocké
+            # Vérifier si déjà stocké (par nom de fichier ou contenu)
             existing = list(TRIPS_DIR.glob(f"*_{md5[:8]}*.json"))
+            if not existing:
+                # Chercher aussi dans le contenu des fichiers (cas multi-ordi)
+                for f in TRIPS_DIR.glob("*.json"):
+                    if f.name == "health_metrics.json":
+                        continue
+                    try:
+                        import json as _json2
+                        with open(f) as _f2:
+                            _d = _json2.load(_f2)
+                        if _d.get("trip_key", "") == md5 or f.stem.endswith(md5[:8]):
+                            existing = [f]
+                            break
+                    except Exception:
+                        pass
             if existing:
                 # Lire le trip_id depuis le fichier existant pour pouvoir flusher correctement
                 import json as _json
                 with open(existing[0]) as _f:
                     _stored = _json.load(_f)
                 _trip_id = _stored.get("trip_id", "").encode()
+                if not _trip_id:
+                    print(f"  [!] trip_id manquant dans {existing[0].name}, flush impossible")
+                    print(f"  [!] Arrêt pour éviter boucle infinie")
+                    break
                 print(f"  [=] Trajet {md5[:8]}... déjà stocké, flush avec trip_id et suivant")
                 await client.write_gatt_char(CHAR_FLUSH_TRIP, _trip_id, response=False)
                 await asyncio.sleep(2)
+                # Vérifier que le MD5 a changé après le flush
+                new_md5 = bytes(await client.read_gatt_char(CHAR_TRIP_MD5)).decode("utf-8", errors="replace").strip('\x00')
+                if new_md5 == md5:
+                    print(f"  [!] MD5 inchangé après flush — le Pi n'a pas accepté le trip_id")
+                    print(f"  [!] Arrêt pour éviter boucle infinie")
+                    break
                 continue
 
             print(f"\n  [>] Lecture trajet {i+1} (MD5: {md5[:8]}...)...")
@@ -139,16 +181,24 @@ async def sync_trips():
                 print(f"  [!] Trajet vide ou illisible")
 
             # Flush pour passer au suivant
-            if i < trips_avail:
-                trip_id_bytes = trip.get("trip_id", "").encode() if trip else b""
-                print(f"  [*] Flush trajet ({trip.get('trip_id','?') if trip else '?'})...")
-                await client.write_gatt_char(CHAR_FLUSH_TRIP, trip_id_bytes, response=False)
+            i += 1
+            if True:
+                if trip is None:
+                    print(f"  [!] Trajet illisible, pas de flush (on réessaiera plus tard)")
+                    break
+                trip_id_bytes = trip.get("trip_id", "").encode()
+                if not trip_id_bytes:
+                    print(f"  [!] trip_id manquant, pas de flush")
+                    break
+                print(f"  [*] Flush trajet ({trip.get('trip_id','?')})...")
+                try:
+                    await client.write_gatt_char(CHAR_FLUSH_TRIP, trip_id_bytes, response=False)
+                except Exception as e:
+                    print(f"  [!] Erreur flush : {e} — on réessaiera plus tard")
+                    break
                 await asyncio.sleep(2)
 
-                new_avail = int.from_bytes(bytes(await client.read_gatt_char(CHAR_TRIPS_AVAIL)), "little")
-                if new_avail == 0:
-                    print("  [*] Plus de trajets disponibles.")
-                    break
+                # Continuer la boucle — le prochain MD5 nous dira s'il reste des trajets
 
     print(f"\n[+] Sync terminée. {len(new_trips)} nouveau(x) trajet(s) récupéré(s).")
     return new_trips
@@ -159,10 +209,20 @@ def load_all_trips():
     if not TRIPS_DIR.exists():
         return []
     trips = []
+    skip = {"health_metrics.json"}
     for f in sorted(TRIPS_DIR.glob("*.json")):
+        if f.name in skip:
+            continue
         try:
             with open(f) as fp:
-                trips.append(json.load(fp))
+                data = json.load(fp)
+            if not isinstance(data, dict):
+                print(f"[!] Ignoré (format inattendu) : {f.name}")
+                continue
+            if "legs" not in data:
+                print(f"[!] Ignoré (pas de legs) : {f.name}")
+                continue
+            trips.append(data)
         except Exception as e:
             print(f"[!] Erreur lecture {f.name}: {e}")
     return trips
